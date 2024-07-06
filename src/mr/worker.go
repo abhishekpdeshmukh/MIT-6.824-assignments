@@ -1,10 +1,16 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"sort"
+	"strconv"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +19,11 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+type ByKey []KeyValue
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -24,18 +35,88 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
-//
+
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+	for {
+		reply := RequestTask()
+		// fmt.Println("mr-" + strconv.Itoa(reply.currMapIndex) + "-" + strconv.Itoa(reply.currReduceIndex))
+		if reply.Type == "Map" {
+			intermediate := []KeyValue{}
+			file, err := os.Open(reply.File)
+			if err != nil {
+				log.Fatalf("cannot open %v", reply.File)
+			}
+			content, err := ioutil.ReadAll(file)
+			if err != nil {
+				log.Fatalf("cannot read %v", reply.File)
+			}
+			file.Close()
 
-	// Your worker implementation here.
+			kva := mapf(reply.File, string(content))
+			intermediate = append(intermediate, kva...)
+			sort.Sort(ByKey(intermediate))
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+			for _, kv := range intermediate {
+				fileName := "mr-" + strconv.Itoa(reply.currMapIndex) + "-" + strconv.Itoa(ihash(kv.Key)%10)
+				file, err = os.OpenFile(fileName, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0600)
+				enc := json.NewEncoder(file)
+				if err != nil {
+					log.Fatalf("cannot create file %v: %v", fileName, err)
+				}
+				err := enc.Encode(&kv)
+				if err != nil {
+					log.Fatalf("cannot encode kv %v: %v", kv, err)
+				}
+				// fmt.Println("Wrote " + fileName)
+				file.Close()
+			}
+			// fmt.Println("Wrote " + fileName)
 
+		} else if reply.Type == "Reduce" {
+			fmt.Printf("LOL\n")
+
+			file, err := os.Open(reply.File)
+			if err != nil {
+				log.Fatalf("Cannot Open  %v in Reduce", reply.File)
+			}
+			var kvs []KeyValue
+			dec := json.NewDecoder(file)
+			for {
+				var kv KeyValue
+				if err := dec.Decode(&kv); err != nil {
+					break
+				}
+				kvs = append(kvs, kv)
+			}
+			i := 0
+			fileName := "mr-out-" + strconv.Itoa(reply.TaskNum)
+			file, err = os.Create(fileName)
+			if err != nil {
+				log.Fatalf("cannot open %v", fileName)
+			}
+			for i < len(kvs) {
+				j := i + 1
+				for j < len(kvs) && kvs[j].Key == kvs[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, kvs[k].Value)
+				}
+				output := reducef(kvs[i].Key, values)
+
+				// this is the correct format for each line of Reduce output.
+				fmt.Fprintf(file, "%v %v\n", kvs[i].Key, output)
+
+				i = j
+			}
+			fmt.Println("Data written to file successfully.")
+			// break
+		}
+	}
 }
 
 //
@@ -43,28 +124,20 @@ func Worker(mapf func(string, string) []KeyValue,
 //
 // the RPC argument and reply types are defined in rpc.go.
 //
-func CallExample() {
 
-	// declare an argument structure.
+func RequestTask() TaskOrderReply {
 	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
+	reply := TaskOrderReply{}
+	ok := call("Coordinator.AskForTask", &args, &reply)
 	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
+		// fmt.Printf("Task Type  %v\n", reply.Type)
+		// fmt.Printf("Task File Name %v\n", reply.File)
+		// fmt.Printf("Task No  %v\n", reply.TaskNum)
+		// return reply
 	} else {
 		fmt.Printf("call failed!\n")
 	}
+	return reply
 }
 
 //
